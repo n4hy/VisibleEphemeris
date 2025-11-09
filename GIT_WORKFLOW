@@ -1,0 +1,16 @@
+# Git Workflow — VisibleEphemeris
+
+Repository: `git@github.com:n4hy/VisibleEphemeris.git`  
+Branch model: **single stable `main` + optional feature branches**.
+
+---
+
+## 1. Daily Use (Single Machine)
+
+After editing code or docs:
+
+```bash
+git status                      # See what changed
+git add <files...>              # Stage your changes
+git commit -m "Explain what you changed"
+git push                        # Update origin/main
