@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Skyfield / TLE cache
+_skyfield_cache/
+
+# Editor / OS cruft
+*.swp
+*.swo
+.DS_Store
