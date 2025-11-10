@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Dr. Robert W. McGwier, PhD
 """
-Visible_Ephemeris_2_5_7_apogee.py
+Visible_Ephemeris.py
 
 Real-time satellite visibility monitor using Skyfield.
 
@@ -28,7 +28,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import List, Optional
 
 import numpy as np
 from skyfield.api import Loader, wgs84
@@ -77,12 +77,10 @@ TWILIGHT_DEGS = {
 # ---------------------------------------------------------------------------
 
 def utcnow() -> dt.datetime:
-    """Return current UTC time (to seconds)."""
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
 
 def file_is_stale(path: Path, max_age_hours: float) -> bool:
-    """Return True if file missing or older than max_age_hours."""
     if not path.exists():
         return True
     age = time.time() - path.stat().st_mtime
@@ -90,7 +88,6 @@ def file_is_stale(path: Path, max_age_hours: float) -> bool:
 
 
 def download_tle(url: str, dest: Path, timeout: int = 20) -> None:
-    """Download TLE file from url into dest."""
     dest.parent.mkdir(parents=True, exist_ok=True)
     if requests is not None:
         r = requests.get(url, timeout=timeout)
@@ -104,16 +101,13 @@ def download_tle(url: str, dest: Path, timeout: int = 20) -> None:
 
 
 def abbreviate_name(name: str) -> str:
-    """Strip bracket/paren annotations and compress whitespace for display."""
     import re
     n = re.sub(r"\[[^\]]*\]", "", name)
     n = re.sub(r"\([^)]*\)", "", n)
-    n = " ".join(n.split())
-    return n
+    return " ".join(n.split())
 
 
 def compile_mask_list(exprs: Optional[str]) -> Optional[List[str]]:
-    """Turn comma-separated substrings into a list, or None if empty."""
     if not exprs:
         return None
     parts = [e.strip() for e in exprs.split(",") if e.strip()]
@@ -123,7 +117,6 @@ def compile_mask_list(exprs: Optional[str]) -> Optional[List[str]]:
 def name_matches(name: str,
                  include: Optional[List[str]],
                  exclude: Optional[List[str]]) -> bool:
-    """Return True if satellite name passes include/exclude substring filters."""
     lname = name.lower()
     if exclude:
         for pat in exclude:
@@ -225,7 +218,6 @@ es.onerror = (e) => {
 # ---------------------------------------------------------------------------
 
 def start_web_server(q: "queue.Queue", host: str, port: int) -> None:
-    """Start a Flask web UI with an SSE endpoint that streams snapshots."""
     app = Flask(__name__)
 
     @app.route("/")
@@ -253,7 +245,6 @@ def start_web_server(q: "queue.Queue", host: str, port: int) -> None:
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build and return the command-line argument parser."""
     ap = argparse.ArgumentParser(
         description="Visible Ephemeris real-time satellite visibility monitor"
     )
@@ -333,7 +324,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    # Twilight threshold (Sun altitude for "night")
+    # Twilight threshold
     if args.twilight == "custom":
         if args.twilight_deg is None or args.twilight_deg >= 0.0:
             print("[ERROR] --twilight custom requires --twilight-deg < 0")
@@ -376,9 +367,16 @@ def main() -> None:
     sun = eph["sun"]
     topos = wgs84.latlon(args.lat, args.lon, elevation_m=args.elev)
 
-    # TLE handling
+    # ---------------- TLE handling (fixed) ----------------
     tle_url = args.tle_url or CELESTRAK_GROUPS[args.group]
-    tle_path = Path(args.tle_file)
+
+    user_tle = Path(args.tle_file)
+
+    if user_tle.is_absolute():
+        tle_path = user_tle
+    else:
+        # Always store cached TLEs directly under CACHE_DIR
+        tle_path = CACHE_DIR / user_tle.name
 
     if file_is_stale(tle_path, args.refresh_hrs):
         print("[INFO] Fetching TLEs…")
@@ -388,12 +386,16 @@ def main() -> None:
             print(f"[WARN] TLE download failed: {e}")
 
     try:
-        satellites = load.tle_file(str(tle_path))
+        if tle_path.is_absolute():
+            satellites = load.tle_file(str(tle_path))
+        else:
+            # Let Loader(CACHE_DIR) resolve this by filename only
+            satellites = load.tle_file(tle_path.name)
     except Exception as e:
         print(f"[ERROR] loading TLE file {tle_path}: {e}")
         sys.exit(1)
+    # ------------------------------------------------------
 
-    # Keep only real satellites
     satellites = [s for s in satellites if isinstance(s, EarthSatellite)]
     if not satellites:
         print("[ERROR] no satellites from TLE file")
@@ -404,14 +406,12 @@ def main() -> None:
     kept: List[EarthSatellite] = []
     for sat in satellites:
         try:
-            # SGP4 model stores semi-major axis in Earth radii via radiusearthkm
             a = float(sat.model.a) * float(sat.model.radiusearthkm)  # km
             e = float(sat.model.ecco)
             apogee_alt = a * (1.0 + e) - earth_radius_km
             if apogee_alt <= args.max_apogee:
                 kept.append(sat)
         except Exception:
-            # If anything is off with elements, drop that satellite
             continue
 
     satellites = kept
@@ -421,7 +421,7 @@ def main() -> None:
 
     print(f"[INFO] Tracking {len(satellites)} satellites after apogee <= {args.max_apogee} km")
 
-    # Name masks (apply after apogee filter)
+    # Name masks
     inc = compile_mask_list(args.mask_include)
     exc = compile_mask_list(args.mask_exclude)
     if inc or exc:
@@ -458,28 +458,22 @@ def main() -> None:
                 try:
                     sunlit[i] = sat.at(t).is_sunlit(eph)
                 except Exception:
-                    sunlit[i] = True  # if in doubt, don't hide
+                    sunlit[i] = True
 
-            # Base mask: elevation
             mask = alts >= min_el
-
-            # Visible-only: sat sunlit AND observer in night
             if args.visible_only:
                 mask &= sunlit & is_night
 
             idx = np.where(mask)[0]
-            # sort by descending elevation
             idx = idx[np.argsort(-alts[idx])]
-            # limit number of satellites
             idx = idx[:maxsat]
 
-            # Build rows for output and telemetry
             rows = [
                 (abbreviate_name(satellites[i].name), azs[i], alts[i], rngs[i])
                 for i in idx
             ]
 
-            # Clear screen and print table
+            # Clear and print
             sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.flush()
 
@@ -497,7 +491,6 @@ def main() -> None:
             print()
             print("Press 'q' then Enter to quit.", flush=True)
 
-            # Snapshot payload for UDP/Web
             snapshot = {
                 "type": "snapshot",
                 "epoch_utc": now.isoformat(),
@@ -521,10 +514,9 @@ def main() -> None:
                 try:
                     sse_queue.put_nowait(snapshot)
                 except queue.Full:
-                    # Drop if the queue is full; next frame will catch up
                     pass
 
-            # Check for quit request (q + Enter)
+            # Check for 'q' quit
             try:
                 rlist, _, _ = select.select([sys.stdin], [], [], 0)
                 if sys.stdin in rlist:
@@ -533,10 +525,8 @@ def main() -> None:
                         print("[INFO] Quit requested by user.")
                         break
             except Exception:
-                # If stdin not usable (e.g. no TTY), just skip
                 pass
 
-            # Sleep until next interval
             elapsed = time.perf_counter() - loop_start
             delay = float(args.interval) - elapsed
             if delay > 0:
