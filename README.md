@@ -1,5 +1,4 @@
-# Visible Ephemeris — Version 2.5.7-apogee
-
+# Visible Ephemeris 
 **Author:** Dr. Robert W. McGwier, PhD  
 **License:** MIT License  
 
