@@ -2,17 +2,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2025 Dr. Robert W. McGwier, PhD
 """
-Visible_Ephemeris.py - IMPROVED VERSION
+Visible_Ephemeris_Phase1.py
 
-Real-time satellite visibility monitor using Skyfield.
-This version implements high-priority improvements from the code analysis.
-
-Key Improvements:
-- Better error handling and input validation
-- Resource cleanup with context managers
-- Pre-allocated numpy arrays for performance
-- Improved robustness in orbital calculations
-- Better logging infrastructure
+Real-time satellite visibility monitor with Phase 1 enhancements:
+- Fisheye all-sky projection
+- Enhanced web UI with color-coded satellites
+- Click-to-view details panel
+- Modern dark theme styling
 """
 
 import argparse
@@ -27,7 +23,7 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -42,7 +38,7 @@ except Exception:
     requests = None
 
 try:
-    from flask import Flask, Response, render_template_string, stream_with_context
+    from flask import Flask, Response, render_template_string
     HAVE_FLASK = True
 except Exception:
     HAVE_FLASK = False
@@ -51,7 +47,7 @@ except Exception:
 # Constants
 # ---------------------------------------------------------------------------
 
-VERSION = "2.5.8-improved"
+VERSION = "3.0.0-phase1"
 
 CACHE_DIR = Path("_skyfield_cache")
 CACHE_DIR.mkdir(exist_ok=True)
@@ -73,13 +69,17 @@ TWILIGHT_DEGS = {
     "astronomical": 18.0,
 }
 
-# Physical constants
-EARTH_RADIUS_KM = 6371.0  # Mean Earth radius in kilometers
-FULL_CIRCLE_DEG = 360.0    # Degrees in a circle
+EARTH_RADIUS_KM = 6371.0
+FULL_CIRCLE_DEG = 360.0
 
-# Regex patterns (pre-compiled for efficiency)
+# Regex patterns (pre-compiled)
 _BRACKET_PATTERN = re.compile(r"\[[^\]]*\]")
 _PAREN_PATTERN = re.compile(r"\([^)]*\)")
+
+# Special satellites for highlighting
+SPECIAL_SATELLITES = {
+    "ISS", "HUBBLE", "TIANGONG", "CSS", "HST"
+}
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -98,20 +98,32 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SatelliteObservation:
-    """Single satellite observation data."""
+    """Enhanced satellite observation data with visibility info."""
     name: str
     azimuth_deg: float
     elevation_deg: float
     range_km: float
+    sunlit: bool
+    is_special: bool = False
+    norad_id: int = 0
     
     def to_dict(self):
         """Convert to dictionary for JSON serialization."""
-        return {
-            "name": self.name,
-            "az": self.azimuth_deg,
-            "el": self.elevation_deg,
-            "range_km": self.range_km
-        }
+        return asdict(self)
+    
+    def get_color_code(self) -> str:
+        """
+        Return color code based on visibility status.
+        - Red: Special satellites (ISS, Hubble, etc.)
+        - Green: Sunlit and visible
+        - Gray: In shadow
+        """
+        if self.is_special:
+            return "red"
+        elif self.sunlit:
+            return "green"
+        else:
+            return "gray"
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -151,6 +163,12 @@ def abbreviate_name(name: str) -> str:
     return " ".join(n.split())
 
 
+def is_special_satellite(name: str) -> bool:
+    """Check if satellite is in special list."""
+    name_upper = name.upper()
+    return any(special in name_upper for special in SPECIAL_SATELLITES)
+
+
 def compile_mask_list(exprs: Optional[str]) -> Optional[List[str]]:
     """Comma-separated substrings -> list, or None."""
     if not exprs:
@@ -177,19 +195,7 @@ def name_matches(name: str,
 
 
 def parse_hostport(hostport_str: str, context: str) -> Tuple[str, int]:
-    """
-    Parse 'host:port' string with validation.
-    
-    Args:
-        hostport_str: String in format "host:port"
-        context: Context string for error messages (e.g., "--udp")
-    
-    Returns:
-        Tuple of (host, port)
-    
-    Raises:
-        ValueError: If format is invalid or port is out of range
-    """
+    """Parse 'host:port' string with validation."""
     parts = hostport_str.split(":")
     if len(parts) != 2:
         raise ValueError(f"{context}: expected HOST:PORT, got '{hostport_str}'")
@@ -207,58 +213,27 @@ def parse_hostport(hostport_str: str, context: str) -> Tuple[str, int]:
 
 
 def validate_orbital_elements(sat: EarthSatellite, max_apogee_km: float) -> bool:
-    """
-    Validate satellite orbital elements and check apogee.
-    
-    Args:
-        sat: EarthSatellite object
-        max_apogee_km: Maximum allowed apogee altitude in km
-    
-    Returns:
-        True if satellite passes validation and apogee check
-    """
+    """Validate satellite orbital elements and check apogee."""
     try:
-        # Check that required attributes exist
         if not hasattr(sat.model, 'a') or not hasattr(sat.model, 'ecco'):
-            logger.debug(f"Satellite {sat.name} missing orbital elements")
             return False
         
-        # Extract semi-major axis and eccentricity
         a = float(sat.model.a) * float(sat.model.radiusearthkm)
         e = float(sat.model.ecco)
         
-        # Sanity checks for orbital elements
-        # e should be in [0, 1) for elliptical orbits (TLEs are always elliptical)
-        if e < 0.0 or e >= 1.0:
-            logger.debug(f"Satellite {sat.name} has invalid eccentricity: {e}")
+        if e < 0.0 or e >= 1.0 or a <= 0.0:
             return False
         
-        if a <= 0.0:
-            logger.debug(f"Satellite {sat.name} has invalid semi-major axis: {a}")
-            return False
-        
-        # Calculate apogee altitude above Earth surface
-        # apogee_radius = a(1 + e), apogee_altitude = apogee_radius - R_earth
         apogee_alt = a * (1.0 + e) - EARTH_RADIUS_KM
-        
         return apogee_alt <= max_apogee_km
         
-    except (AttributeError, ValueError, TypeError) as ex:
-        logger.debug(f"Error validating {sat.name}: {ex}")
+    except (AttributeError, ValueError, TypeError):
         return False
 
 
 @contextmanager
 def udp_socket_context(hostport: Optional[str]):
-    """
-    Context manager for UDP socket with automatic cleanup.
-    
-    Args:
-        hostport: Optional "host:port" string
-    
-    Yields:
-        Tuple of (socket, address) or (None, None)
-    """
+    """Context manager for UDP socket with automatic cleanup."""
     if hostport is None:
         yield None, None
         return
@@ -277,91 +252,680 @@ def udp_socket_context(hostport: Optional[str]):
             sock.close()
 
 # ---------------------------------------------------------------------------
-# Web UI template (SSE client) - unchanged from original
+# Enhanced Web UI template with fisheye skymap
 # ---------------------------------------------------------------------------
 
 WEB_TEMPLATE = """<!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
-<title>Visible Ephemeris</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Visible Ephemeris - Phase 1</title>
 <style>
-body{
-  font-family:system-ui,sans-serif;
-  margin:1rem;
-  background:#05070a;
-  color:#f0f3f6;
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
-table{
-  border-collapse:collapse;
-  width:100%;
-  font-size:0.9rem;
+
+body {
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+  background: #0a0e14;
+  color: #e6edf3;
+  padding: 1rem;
+  min-height: 100vh;
 }
-th,td{
-  border-bottom:1px solid #222;
-  padding:0.25rem 0.4rem;
-  text-align:right;
+
+.container {
+  max-width: 1600px;
+  margin: 0 auto;
 }
-th:first-child,td:first-child{
-  text-align:left;
+
+header {
+  margin-bottom: 1.5rem;
+  border-bottom: 2px solid #1f2937;
+  padding-bottom: 1rem;
 }
-tr:nth-child(even){
-  background:#0b0f16;
+
+h1 {
+  font-size: 1.75rem;
+  font-weight: 600;
+  color: #58a6ff;
+  margin-bottom: 0.5rem;
 }
-small{
-  color:#9aa4b2;
+
+.epoch {
+  color: #8b949e;
+  font-size: 0.9rem;
+}
+
+.sun-info {
+  display: inline-block;
+  margin-left: 1rem;
+  padding: 0.25rem 0.75rem;
+  background: #161b22;
+  border-radius: 6px;
+  font-size: 0.85rem;
+}
+
+.main-content {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin-bottom: 1.5rem;
+}
+
+@media (max-width: 1024px) {
+  .main-content {
+    grid-template-columns: 1fr;
+  }
+}
+
+.panel {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1.5rem;
+  box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+}
+
+.panel-title {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  color: #58a6ff;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* Skymap Canvas */
+.skymap-container {
+  position: relative;
+  width: 100%;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+#skymap {
+  width: 100%;
+  height: auto;
+  display: block;
+  cursor: crosshair;
+  background: #0d1117;
+  border-radius: 8px;
+}
+
+.skymap-legend {
+  display: flex;
+  justify-content: center;
+  gap: 1.5rem;
+  margin-top: 1rem;
+  font-size: 0.85rem;
+  flex-wrap: wrap;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+}
+
+.legend-dot.special { background: #ff4444; border-color: #ff4444; }
+.legend-dot.visible { background: #44ff44; border-color: #44ff44; }
+.legend-dot.eclipsed { background: #666666; border-color: #666666; }
+
+/* Satellite Table */
+.sat-table-container {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+thead {
+  background: #0d1117;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+th {
+  text-align: right;
+  padding: 0.75rem 0.5rem;
+  font-weight: 600;
+  color: #8b949e;
+  border-bottom: 2px solid #30363d;
+}
+
+th:first-child {
+  text-align: left;
+}
+
+td {
+  padding: 0.5rem;
+  text-align: right;
+  border-bottom: 1px solid #21262d;
+}
+
+td:first-child {
+  text-align: left;
+}
+
+tbody tr {
+  transition: background-color 0.2s;
+  cursor: pointer;
+}
+
+tbody tr:hover {
+  background: #1c2128;
+}
+
+tbody tr.selected {
+  background: #1f2937;
+  border-left: 3px solid #58a6ff;
+}
+
+.sat-name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.sat-indicator {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.sat-indicator.red { background: #ff4444; }
+.sat-indicator.green { background: #44ff44; }
+.sat-indicator.gray { background: #666666; }
+
+/* Details Panel */
+.details-panel {
+  background: #1c2128;
+  padding: 1rem;
+  border-radius: 6px;
+  margin-top: 1rem;
+  display: none;
+}
+
+.details-panel.visible {
+  display: block;
+}
+
+.details-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-top: 0.75rem;
+}
+
+.detail-item {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.detail-label {
+  font-size: 0.75rem;
+  color: #8b949e;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.detail-value {
+  font-size: 1.1rem;
+  font-weight: 600;
+  color: #e6edf3;
+}
+
+.close-details {
+  float: right;
+  background: none;
+  border: none;
+  color: #8b949e;
+  cursor: pointer;
+  font-size: 1.5rem;
+  line-height: 1;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+}
+
+.close-details:hover {
+  color: #e6edf3;
+}
+
+/* Status messages */
+.no-satellites {
+  text-align: center;
+  padding: 2rem;
+  color: #8b949e;
+  font-style: italic;
+}
+
+/* Loading indicator */
+.loading {
+  text-align: center;
+  padding: 2rem;
+  color: #8b949e;
+}
+
+.loading::after {
+  content: '...';
+  animation: dots 1.5s infinite;
+}
+
+@keyframes dots {
+  0%, 20% { content: '.'; }
+  40% { content: '..'; }
+  60%, 100% { content: '...'; }
 }
 </style>
 </head>
 <body>
-<h1>Visible Ephemeris <small id="epoch"></small></h1>
-<table>
-  <thead>
-    <tr>
-      <th>Name</th>
-      <th>Az (deg)</th>
-      <th>El (deg)</th>
-      <th>Range (km)</th>
-    </tr>
-  </thead>
-  <tbody id="rows"></tbody>
-</table>
+<div class="container">
+  <header>
+    <h1>🛰️ Visible Ephemeris</h1>
+    <div>
+      <span class="epoch" id="epoch">Connecting...</span>
+      <span class="sun-info" id="sunInfo"></span>
+    </div>
+  </header>
+
+  <div class="main-content">
+    <!-- Skymap Panel -->
+    <div class="panel">
+      <div class="panel-title">
+        <span>🌌</span>
+        <span>All-Sky View</span>
+      </div>
+      <div class="skymap-container">
+        <canvas id="skymap" width="600" height="600"></canvas>
+      </div>
+      <div class="skymap-legend">
+        <div class="legend-item">
+          <div class="legend-dot special"></div>
+          <span>Special (ISS, Hubble)</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot visible"></div>
+          <span>Sunlit & Visible</span>
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot eclipsed"></div>
+          <span>Eclipsed</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Satellite List Panel -->
+    <div class="panel">
+      <div class="panel-title">
+        <span>📡</span>
+        <span>Visible Satellites</span>
+        <span style="margin-left: auto; font-size: 0.9rem; font-weight: normal;" id="satCount">0</span>
+      </div>
+      <div class="sat-table-container">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>Az (°)</th>
+              <th>El (°)</th>
+              <th>Range (km)</th>
+            </tr>
+          </thead>
+          <tbody id="satTableBody">
+            <tr><td colspan="4" class="loading">Waiting for data</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- Details Panel -->
+  <div class="panel" id="detailsPanel">
+    <div class="panel-title">
+      <span>ℹ️</span>
+      <span id="detailsTitle">Satellite Details</span>
+      <button class="close-details" onclick="closeDetails()">×</button>
+    </div>
+    <div class="details-grid" id="detailsGrid"></div>
+  </div>
+</div>
+
 <script>
-const epoch = document.getElementById('epoch');
-const tbody = document.getElementById('rows');
+// State
+let currentData = null;
+let selectedSatellite = null;
+
+// Canvas setup
+const canvas = document.getElementById('skymap');
+const ctx = canvas.getContext('2d');
+const centerX = canvas.width / 2;
+const centerY = canvas.height / 2;
+const radius = Math.min(centerX, centerY) - 40;
+
+// SSE Connection
 const es = new EventSource('/events');
 
 es.onmessage = (m) => {
   try {
-    const o = JSON.parse(m.data);
-    if (o.type === 'snapshot') {
-      epoch.textContent = ' — ' + o.epoch_utc;
-      tbody.innerHTML = '';
-      (o.rows || []).forEach(r => {
-        const tr = document.createElement('tr');
-        tr.innerHTML =
-          '<td style="text-align:left;">' + r.name + '</td>' +
-          '<td>' + r.az.toFixed(1) + '</td>' +
-          '<td>' + r.el.toFixed(1) + '</td>' +
-          '<td>' + r.range_km.toFixed(1) + '</td>';
-        tbody.appendChild(tr);
-      });
+    const data = JSON.parse(m.data);
+    
+    // Validate data structure
+    if (!data || data.type !== 'snapshot') {
+      console.log('Ignoring non-snapshot data');
+      return;
     }
+    
+    if (!data.rows || !Array.isArray(data.rows)) {
+      console.error('Data missing rows array:', data);
+      return;
+    }
+    
+    // Validate each satellite has required fields
+    const validRows = data.rows.filter(sat => {
+      if (!sat.az || !sat.el || !sat.range_km) {
+        console.warn('Skipping invalid satellite:', sat);
+        return false;
+      }
+      return true;
+    });
+    
+    console.log('Rendering', validRows.length, 'valid satellites');
+    data.rows = validRows;
+    
+    currentData = data;
+    updateUI(data);
+    drawSkymap(data);
+    
   } catch (e) {
-    console.error('Bad SSE data', e, m.data);
+    console.error('Parse error:', e.message);
+    console.error('Data was:', m.data.substring(0, 200));
   }
 };
 
 es.onerror = (e) => {
   console.error('SSE error', e);
+  document.getElementById('epoch').textContent = 'Connection error';
 };
+
+// Update UI elements
+function updateUI(data) {
+  console.log('updateUI called with', data.rows?.length, 'rows');
+  // Update epoch and sun info
+  document.getElementById('epoch').textContent = data.epoch_utc;
+  document.getElementById('sunInfo').textContent = 
+    `Sun: ${data.sun_alt?.toFixed(1) || 0}° | ${data.is_night ? '🌙 Night' : '☀️ Day'}`;
+  
+  // Update satellite count
+  document.getElementById('satCount').textContent = 
+    `${data.rows.length} satellite${data.rows.length !== 1 ? 's' : ''}`;
+  
+  // Update table
+  updateTable(data.rows);
+}
+
+// Update satellite table
+function updateTable(rows) {
+  const tbody = document.getElementById('satTableBody');
+  
+  if (!rows || rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="no-satellites">No satellites visible</td></tr>';
+    return;
+  }
+  
+  tbody.innerHTML = rows.map((sat, idx) => {
+    // Safety checks for all values
+    const name = sat.name || 'Unknown';
+    const color = sat.color || 'gray';
+    const az = (sat.az !== undefined) ? sat.az.toFixed(1) : '0.0';
+    const el = (sat.el !== undefined) ? sat.el.toFixed(1) : '0.0';
+    const range = (sat.range_km !== undefined) ? sat.range_km.toFixed(1) : '0.0';
+    
+    return `
+    <tr onclick="selectSatellite(${idx})" id="sat-row-${idx}">
+      <td>
+        <div class="sat-name">
+          <div class="sat-indicator ${color}"></div>
+          <span>${name}</span>
+        </div>
+      </td>
+      <td>${az}</td>
+      <td>${el}</td>
+      <td>${range}</td>
+    </tr>
+    `;
+  }).join('');
+}
+
+// Draw fisheye skymap
+function drawSkymap(data) {
+  console.log('drawSkymap called, satellites:', data.rows?.length);
+  // Clear canvas
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  
+  // Draw elevation circles
+  ctx.strokeStyle = '#30363d';
+  ctx.lineWidth = 1;
+  [30, 60, 90].forEach(el => {
+    const r = ((90 - el) / 90) * radius;
+    ctx.beginPath();
+    ctx.arc(centerX, centerY, r, 0, 2 * Math.PI);
+    ctx.stroke();
+  });
+  
+  // Draw cardinal directions
+  ctx.fillStyle = '#8b949e';
+  ctx.font = '14px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  
+  const labelRadius = radius + 25;
+  ctx.fillText('N', centerX, centerY - labelRadius);
+  ctx.fillText('E', centerX + labelRadius, centerY);
+  ctx.fillText('S', centerX, centerY + labelRadius);
+  ctx.fillText('W', centerX - labelRadius, centerY);
+  
+  // Draw horizon circle
+  ctx.strokeStyle = '#58a6ff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(centerX, centerY, radius, 0, 2 * Math.PI);
+  ctx.stroke();
+  
+  // Draw satellites
+  if (data.rows && data.rows.length > 0) {
+    data.rows.forEach((sat, idx) => {
+      // Skip if required data is missing
+      if (sat.az === undefined || sat.el === undefined) {
+        console.warn('Skipping satellite with undefined az/el:', sat.name);
+        return;
+      }
+      
+      const pos = azElToXY(sat.az, sat.el);
+      
+      // Determine color and size
+      let color, size;
+      if (sat.color === 'red') {
+        color = '#ff4444';
+        size = 8;
+      } else if (sat.color === 'green') {
+        color = '#44ff44';
+        size = 6;
+      } else {
+        color = '#666666';
+        size = 5;
+      }
+      
+      // Highlight if selected
+      if (selectedSatellite === idx) {
+        ctx.strokeStyle = '#58a6ff';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, size + 4, 0, 2 * Math.PI);
+        ctx.stroke();
+      }
+      
+      // Draw satellite
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(pos.x, pos.y, size, 0, 2 * Math.PI);
+      ctx.fill();
+      
+      // Draw label for special satellites
+      if (sat.color === 'red') {
+        ctx.fillStyle = '#ff4444';
+        ctx.font = 'bold 11px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(sat.name, pos.x, pos.y - size - 8);
+      }
+    });
+  }
+}
+
+// Convert Az/El to canvas X/Y (fisheye projection)
+function azElToXY(az, el) {
+  // Radius from center (0 at zenith, radius at horizon)
+  const r = ((90 - el) / 90) * radius;
+  
+  // Angle (0° = North, clockwise)
+  // Canvas: 0° = East, so rotate by -90°
+  const theta = (az - 90) * Math.PI / 180;
+  
+  return {
+    x: centerX + r * Math.cos(theta),
+    y: centerY + r * Math.sin(theta)
+  };
+}
+
+// Canvas click handler
+canvas.addEventListener('click', (e) => {
+  if (!currentData || !currentData.rows) return;
+  
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = canvas.width / rect.width;
+  const scaleY = canvas.height / rect.height;
+  const clickX = (e.clientX - rect.left) * scaleX;
+  const clickY = (e.clientY - rect.top) * scaleY;
+  
+  // Find nearest satellite
+  let minDist = Infinity;
+  let nearestIdx = -1;
+  
+  currentData.rows.forEach((sat, idx) => {
+    const pos = azElToXY(sat.az, sat.el);
+    const dist = Math.sqrt((pos.x - clickX) ** 2 + (pos.y - clickY) ** 2);
+    if (dist < minDist && dist < 20) {  // 20px click tolerance
+      minDist = dist;
+      nearestIdx = idx;
+    }
+  });
+  
+  if (nearestIdx >= 0) {
+    selectSatellite(nearestIdx);
+  }
+});
+
+// Select satellite
+function selectSatellite(idx) {
+  selectedSatellite = idx;
+  
+  // Update table selection
+  document.querySelectorAll('#satTableBody tr').forEach(row => {
+    row.classList.remove('selected');
+  });
+  const row = document.getElementById(`sat-row-${idx}`);
+  if (row) {
+    row.classList.add('selected');
+    row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+  
+  // Show details
+  showDetails(currentData.rows[idx]);
+  
+  // Redraw skymap with highlight
+  drawSkymap(currentData);
+}
+
+// Show satellite details
+function showDetails(sat) {
+  const panel = document.getElementById('detailsPanel');
+  const title = document.getElementById('detailsTitle');
+  const grid = document.getElementById('detailsGrid');
+  
+  title.textContent = sat.name;
+  
+  grid.innerHTML = `
+    <div class="detail-item">
+      <div class="detail-label">Azimuth</div>
+      <div class="detail-value">${sat.az.toFixed(2)}°</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Elevation</div>
+      <div class="detail-value">${sat.el.toFixed(2)}°</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Range</div>
+      <div class="detail-value">${sat.range_km.toFixed(1)} km</div>
+    </div>
+    <div class="detail-item">
+      <div class="detail-label">Status</div>
+      <div class="detail-value">${sat.sunlit ? '☀️ Sunlit' : '🌑 Eclipsed'}</div>
+    </div>
+    ${sat.is_special ? `
+    <div class="detail-item">
+      <div class="detail-label">Type</div>
+      <div class="detail-value">⭐ Special</div>
+    </div>
+    ` : ''}
+    ${sat.norad_id ? `
+    <div class="detail-item">
+      <div class="detail-label">NORAD ID</div>
+      <div class="detail-value">${sat.norad_id}</div>
+    </div>
+    ` : ''}
+  `;
+  
+  panel.classList.add('visible');
+}
+
+// Close details panel
+function closeDetails() {
+  document.getElementById('detailsPanel').classList.remove('visible');
+  selectedSatellite = null;
+  drawSkymap(currentData);
+}
+
+// Make canvas responsive
+window.addEventListener('resize', () => {
+  if (currentData) {
+    drawSkymap(currentData);
+  }
+});
 </script>
 </body>
 </html>
 """
 
 # ---------------------------------------------------------------------------
-# Web server (Flask + SSE) - unchanged from original
+# Web server (Flask + SSE)
 # ---------------------------------------------------------------------------
 
 def start_web_server(q: queue.Queue, host: str, port: int) -> None:
@@ -374,35 +938,33 @@ def start_web_server(q: queue.Queue, host: str, port: int) -> None:
 
     @app.route("/events")
     def events():
-        @stream_with_context
         def gen():
             while True:
-                msg = q.get()
+                msg = q.get()  # Blocks until data available
                 yield f"data: {json.dumps(msg)}\n\n"
-
+        
         return Response(
             gen(),
             mimetype="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "X-Accel-Buffering": "no",
-            },
+            }
         )
 
-    app.run(host=host, port=port, threaded=True)
+    app.run(host=host, port=port, threaded=True, debug=False)
 
 # ---------------------------------------------------------------------------
-# CLI parser - same as original with logging option added
+# CLI parser
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
     """Build argument parser."""
     ap = argparse.ArgumentParser(
-        description="Real-time satellite visibility monitor (Improved Version)",
+        description="Real-time satellite visibility monitor - Phase 1 Enhanced",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     
-    # Observer location
     ap.add_argument("--lat", type=float, required=True,
                     help="observer latitude (degrees)")
     ap.add_argument("--lon", type=float, required=True,
@@ -410,10 +972,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--elev", type=float, default=0.0,
                     help="observer elevation (meters)")
 
-    # Display options
     ap.add_argument("--interval", type=float, default=1.0,
                     help="refresh interval (seconds)")
-    ap.add_argument("--maxsat", type=int, default=20,
+    ap.add_argument("--maxsat", type=int, default=40,
                     help="max satellites to display/stream")
     ap.add_argument("--min-el", type=float, default=0.0,
                     help="minimum elevation (degrees)")
@@ -425,28 +986,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--twilight-deg", type=float, default=None,
                     help="custom Sun altitude (deg, negative) if twilight=custom")
 
-    # TLE handling
     ap.add_argument("--group", type=str, default="active",
                     choices=sorted(CELESTRAK_GROUPS.keys()),
                     help="Celestrak TLE group")
     ap.add_argument("--tle-url", type=str, default=None,
                     help="override TLE URL")
-    ap.add_argument("--tle-file", type=Path, default=DEFAULT_TLE_FILE,
-                    help="local TLE cache file path")
+    ap.add_argument("--tle-file", type=str, default="active.tle",
+                    help="TLE filename in cache directory")
     ap.add_argument("--refresh-hrs", type=float, default=24.0,
                     help="max TLE age in hours before refresh")
 
-    # Name masks
     ap.add_argument("--mask-include", type=str, default=None,
                     help="comma-separated substrings; keep names containing any")
     ap.add_argument("--mask-exclude", type=str, default=None,
                     help="comma-separated substrings; drop names containing any")
 
-    # Apogee filter
-    ap.add_argument("--max-apogee", type=float, default=500.0,
+    ap.add_argument("--max-apogee", type=float, default=800.0,
                     help="maximum apogee altitude in km")
 
-    # UDP output
     ap.add_argument("--udp", type=str, default=None,
                     help="send JSON snapshots to HOST:PORT via UDP")
     ap.add_argument("--udp-snapshot", action="store_true",
@@ -454,11 +1011,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--udp-snapshot-max", type=int, default=50,
                     help="max rows per UDP snapshot message")
 
-    # Web UI
     ap.add_argument("--web", type=str, default=None,
                     help="serve Web UI at HOST:PORT (requires Flask)")
     
-    # Logging
     ap.add_argument("--debug", action="store_true",
                     help="enable debug logging")
 
@@ -471,7 +1026,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     
-    # Set logging level
     if args.debug:
         logger.setLevel(logging.DEBUG)
     
@@ -496,11 +1050,19 @@ def main() -> None:
         try:
             host, port = parse_hostport(args.web, "--web")
             sse_queue = queue.Queue(maxsize=128)
+            
+            # Put initial heartbeat message
+            sse_queue.put({
+                "type": "heartbeat",
+                "message": "Connected"
+            })
+            
             threading.Thread(
                 target=start_web_server,
                 args=(sse_queue, host, port),
                 daemon=True,
             ).start()
+            time.sleep(0.5)  # Give Flask time to start
             logger.info(f"Web UI at http://{host}:{port}/")
         except ValueError as e:
             logger.error(str(e))
@@ -514,29 +1076,12 @@ def main() -> None:
     sun = eph["sun"]
     topos = wgs84.latlon(args.lat, args.lon, elevation_m=args.elev)
 
-    # TLE handling (simplified logic)
+    # TLE handling - use simple filename only
     tle_url = args.tle_url or CELESTRAK_GROUPS[args.group]
-    user_tle = Path(args.tle_file)
-
-    # BOB's new version
-
-
-
-    # Determine absolute TLE path
-    if user_tle.is_absolute():
-        tle_path = user_tle
-    elif str(user_tle).startswith(str(CACHE_DIR)):
-        # Already has cache dir prefix (e.g., from DEFAULT_TLE_FILE)
-        tle_path = user_tle
-    else:
-        # Relative paths are relative to CACHE_DIR
-        tle_path = CACHE_DIR / user_tle
-
+    tle_path = CACHE_DIR / args.tle_file
     
-    # Ensure parent directory exists
     tle_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Download if stale
     if file_is_stale(tle_path, args.refresh_hrs):
         logger.info("Fetching TLEs…")
         try:
@@ -547,7 +1092,6 @@ def main() -> None:
                 logger.error(f"No TLE file available at {tle_path}")
                 sys.exit(1)
 
-    # Load TLEs
     try:
         satellites = load.tle_file(str(tle_path))
     except Exception as e:
@@ -559,7 +1103,7 @@ def main() -> None:
         logger.error("no satellites from TLE file")
         sys.exit(1)
 
-    # Apply apogee filter with improved validation
+    # Apply filters
     logger.info(f"Filtering satellites with apogee <= {args.max_apogee} km")
     satellites = [s for s in satellites if validate_orbital_elements(s, args.max_apogee)]
     
@@ -569,7 +1113,6 @@ def main() -> None:
 
     logger.info(f"Tracking {len(satellites)} satellites after apogee filter")
 
-    # Apply name masks
     inc = compile_mask_list(args.mask_include)
     exc = compile_mask_list(args.mask_exclude)
     if inc or exc:
@@ -580,17 +1123,16 @@ def main() -> None:
         logger.error("no satellites remain after filtering")
         sys.exit(1)
 
-    # Pre-allocate numpy arrays for performance
+    # Pre-allocate arrays
     n = len(satellites)
     alts = np.empty(n)
     azs = np.empty(n)
     rngs = np.empty(n)
     sunlit = np.empty(n, dtype=bool)
 
-    # Main loop with UDP context manager for automatic cleanup
+    # Main loop
     with udp_socket_context(args.udp) as (udp_sock, udp_addr):
         if udp_sock is None and args.udp:
-            # parse_hostport failed, error already logged
             sys.exit(2)
         
         try:
@@ -603,99 +1145,104 @@ def main() -> None:
                 sun_alt = (earth + topos).at(t).observe(sun).apparent().altaz()[0].degrees
                 is_night = sun_alt <= sun_alt_thresh
 
-                # Compute ephemeris for all satellites with error handling
+                # Compute ephemeris
                 for i, sat in enumerate(satellites):
                     try:
                         diff = sat - topos
                         alt, az, dist = diff.at(t).altaz()
                         alts[i] = alt.degrees
-                        # Skyfield azimuth is already in [0, 360), but normalize for safety
                         azs[i] = az.degrees % FULL_CIRCLE_DEG
                         rngs[i] = dist.km
                         
                         try:
                             sunlit[i] = sat.at(t).is_sunlit(eph)
                         except Exception:
-                            # Conservative: assume sunlit if check fails
                             sunlit[i] = True
                             
                     except Exception as ex:
-                        # Mark satellite as invalid (below horizon)
                         alts[i] = -90.0
                         azs[i] = 0.0
                         rngs[i] = 0.0
                         sunlit[i] = False
                         logger.debug(f"Computation failed for {sat.name}: {ex}")
 
-                # Apply elevation mask (satellites above minimum elevation angle)
+                # Apply filters
                 mask = alts >= min_el
-                
-                # For visible-only mode, require:
-                #   1. Satellite is sunlit (solar panels illuminated)
-                #   2. Observer is in darkness (sun below twilight threshold)
-                # This ensures the satellite is visible to the naked eye
                 if args.visible_only:
                     mask &= sunlit & is_night
 
-                # Sort by elevation (highest first) and limit to maxsat
                 idx = np.where(mask)[0]
                 idx = idx[np.argsort(-alts[idx])]
                 idx = idx[:maxsat]
 
-                # Build observation list
-                observations = [
-                    SatelliteObservation(
+                # Build observations with enhanced data
+                # Convert numpy types to native Python types explicitly
+                observations = []
+                for i in idx:
+                    obs = SatelliteObservation(
                         name=abbreviate_name(satellites[i].name),
-                        azimuth_deg=azs[i],
-                        elevation_deg=alts[i],
-                        range_km=rngs[i]
+                        azimuth_deg=float(azs[i]),
+                        elevation_deg=float(alts[i]),
+                        range_km=float(rngs[i]),
+                        sunlit=bool(sunlit[i]),
+                        is_special=is_special_satellite(satellites[i].name),
+                        norad_id=int(satellites[i].model.satnum)
                     )
-                    for i in idx
-                ]
+                    observations.append(obs)
 
                 # Terminal output
                 sys.stdout.write("\x1b[2J\x1b[H")
                 sys.stdout.flush()
 
                 mode = "VISIBLE" if args.visible_only else "ALL"
-                print(f"EPOCH: {now:%Y-%m-%d %H:%M:%S}  SunAlt={sun_alt:.1f} deg  Mode={mode}")
-                print(f"{'Name':<32} {'Az(deg)':>8} {'El(deg)':>8} {'Range(km)':>12}")
-                print("-" * 64)
+                print(f"EPOCH: {now:%Y-%m-%d %H:%M:%S}  SunAlt={sun_alt:.1f}°  Mode={mode}  "
+                      f"Night={'YES' if is_night else 'NO'}")
+                print(f"{'Name':<32} {'Az(°)':>8} {'El(°)':>8} {'Range(km)':>12} {'Status':>10}")
+                print("-" * 75)
 
                 if observations:
                     for obs in observations:
+                        status = "🔴SPEC" if obs.is_special else ("🟢VIS" if obs.sunlit else "⚫ECL")
                         print(f"{obs.name:<32.32} {obs.azimuth_deg:8.1f} "
-                              f"{obs.elevation_deg:8.1f} {obs.range_km:12.1f}")
+                              f"{obs.elevation_deg:8.1f} {obs.range_km:12.1f} {status:>10}")
                 else:
                     print("(no satellites match current filters)")
 
                 print()
                 print("Press 'q' then Enter to quit.", flush=True)
 
-                # Build JSON snapshot
-                snapshot = {
-                    "type": "snapshot",
-                    "epoch_utc": now.isoformat(),
-                    "rows": [obs.to_dict() for obs in observations],
-                }
+                # Build enhanced JSON snapshot with explicit type conversion
+                try:
+                    snapshot = {
+                        "type": "snapshot",
+                        "epoch_utc": now.isoformat(),
+                        "sun_alt": float(sun_alt),
+                        "is_night": bool(is_night),
+                        "rows": []
+                    }
+                    
+                    # Build rows with explicit type conversion
+                    for obs in observations:
+                        row = {
+                            "name": str(obs.name),
+                            "az": float(obs.azimuth_deg),
+                            "el": float(obs.elevation_deg),
+                            "range_km": float(obs.range_km),
+                            "sunlit": bool(obs.sunlit),
+                            "is_special": bool(obs.is_special),
+                            "norad_id": int(obs.norad_id),
+                            "color": str(obs.get_color_code())
+                        }
+                        snapshot["rows"].append(row)
+                    
+                    # Test JSON serialization
+                    _ = json.dumps(snapshot)
+                    
+                except Exception as ex:
+                    logger.error(f"Failed to build snapshot: {ex}")
+                    continue
 
-                # UDP snapshot
-                if udp_sock is not None and udp_addr is not None and args.udp_snapshot:
-                    slim = snapshot.copy()
-                    slim["rows"] = slim["rows"][: max(1, int(args.udp_snapshot_max))]
-                    try:
-                        udp_sock.sendto(json.dumps(slim).encode("utf-8"), udp_addr)
-                    except Exception as ex:
-                        logger.debug(f"UDP send failed: {ex}")
-
-                # Web SSE snapshot
-                if sse_queue is not None:
-                    try:
-                        sse_queue.put_nowait(snapshot)
-                    except queue.Full:
-                        pass
-
-                # Check for 'q' to quit
+                # Check for quit
                 try:
                     rlist, _, _ = select.select([sys.stdin], [], [], 0)
                     if sys.stdin in rlist:
@@ -706,12 +1253,48 @@ def main() -> None:
                 except Exception:
                     pass
 
-                # Performance metrics
                 elapsed = time.perf_counter() - loop_start
                 if args.debug:
-                    logger.debug(f"Computation: {elapsed:.3f}s, "
-                               f"Visible: {len(idx)}/{n} satellites")
+                    logger.debug(f"Loop: {elapsed:.3f}s, Visible: {len(idx)}/{n}")
                 
+                # ONLY send data after loop is completely done
+                # UDP snapshot
+                if udp_sock is not None and udp_addr is not None and args.udp_snapshot:
+                    slim = snapshot.copy()
+                    slim["rows"] = slim["rows"][: max(1, int(args.udp_snapshot_max))]
+                    try:
+                        udp_sock.sendto(json.dumps(slim).encode("utf-8"), udp_addr)
+                    except Exception as ex:
+                        logger.debug(f"UDP send failed: {ex}")
+
+                # Web SSE snapshot - send ONLY after complete computation
+                if sse_queue is not None:
+                    try:
+                        # Clear old items if queue is full
+                        while sse_queue.qsize() > 100:
+                            try:
+                                sse_queue.get_nowait()
+                            except queue.Empty:
+                                break
+                        
+                        # Put snapshot in queue ONLY when loop is complete
+                        sse_queue.put_nowait(snapshot)
+                        
+                        if args.debug:
+                            logger.debug(f"SSE: Sent complete snapshot with {len(snapshot['rows'])} satellites")
+                            
+                    except queue.Full:
+                        # Queue full, clear it and try again
+                        try:
+                            sse_queue.get_nowait()
+                            sse_queue.put_nowait(snapshot)
+                        except Exception as ex:
+                            if args.debug:
+                                logger.debug(f"SSE queue error: {ex}")
+                    except Exception as ex:
+                        logger.error(f"SSE queue exception: {ex}")
+                
+                # NOW wait for next cycle
                 delay = float(args.interval) - elapsed
                 if delay > 0:
                     time.sleep(delay)
